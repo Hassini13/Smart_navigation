@@ -1,0 +1,16 @@
+{
+  "name": "route-optimizer",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "install:all": "cd server && npm install && cd ../client && npm install",
+    "dev": "concurrently \"cd server && npm run dev\" \"cd client && npm run dev\"",
+    "start": "concurrently \"cd server && npm start\" \"cd client && npm run preview\""
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "dependencies": {
+    "mysql2": "^3.24.3"
+  }
+}

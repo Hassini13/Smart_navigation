@@ -1,0 +1,8 @@
+{
+  "raw_nodes": 22260,
+  "raw_edges": 59649,
+  "removed_self_loops": 94,
+  "removed_parallel_duplicate_edges": 708,
+  "final_nodes": 22260,
+  "final_edges": 58847
+}

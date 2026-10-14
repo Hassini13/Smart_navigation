@@ -1,0 +1,628 @@
+/**
+ * Hybrid graph partitioner.
+ *
+ * The previous partitioner (cliquePartitioner.js) only looked at graph
+ * connectivity: it seeded partitions from dense triangles/neighborhoods and
+ * grew them with a plain FIFO BFS. It never looked at where a node actually
+ * is on the map or how expensive the roads connecting it are.
+ *
+ * This version scores every "should node X join partition P" decision using
+ * three factors instead of one:
+ *
+ *   1. TOPOLOGY  - how connected X already is to P (shared edges vs. total
+ *                  degree of X).
+ *   2. GEOGRAPHY - how close X is to P's centroid (lat/lon), using the
+ *                  haversine distance.
+ *   3. TRAFFIC   - how cheap the edges connecting X to P are (uses the same
+ *                  edge weight the router uses, i.e. distance adjusted by
+ *                  traffic level).
+ *
+ * The three scores are combined into one hybrid score with configurable
+ * weights, and partitions are grown with a best-first expansion driven by
+ * that score (a max-heap of candidate insertions) instead of plain BFS.
+ * Everything here is deterministic - no randomness - so the same input
+ * always produces the same partitions, which makes it possible to compare
+ * runs fairly.
+ */
+
+// ---------------------------------------------------------------------
+// Configuration - tune these for experiments. Keep them here instead of
+// scattering magic numbers through the algorithm.
+// ---------------------------------------------------------------------
+
+// Target number of partitions. This is the main knob for the "does more
+// partitioning help or hurt" experiment. A bigger network generally wants
+// more partitions so each one stays small enough to search quickly, but
+// more partitions also means more cross-partition boundaries, which can
+// hurt route quality (see PARTITION QUALITY notes in the project readme).
+const NUM_PARTITIONS = 45;
+
+// Relative importance of each factor in the hybrid score. These are not
+// required to sum to 1 - they just set how much each term matters
+// relative to the others.
+//
+// Topology gets the largest share because shrinking the Dijkstra search
+// space depends on nodes that are actually reachable from each other
+// staying in the same partition. Geography is weighted second because the
+// dataset is a real road network - physically close roads are usually
+// also well connected, so this mostly reinforces topology and keeps
+// partitions spatially sensible for the Tamil Nadu map. Traffic/cost gets
+// the smallest weight because it's the most likely of the three to change
+// in a real system, and the partitioning is meant to stay stable even if
+// traffic conditions shift.
+const TOPOLOGY_WEIGHT = 0.5;
+const GEOGRAPHIC_WEIGHT = 0.3;
+const TRAFFIC_WEIGHT = 0.2;
+
+// Minimum distance (km) enforced between newly picked seed nodes, so seeds
+// don't all land in the same dense cluster and leave other areas of the
+// map without a nearby partition to grow from.
+const MIN_SEED_SEPARATION_KM = 0.35;
+
+// Hard ceiling on partition size during the main growth phase, expressed
+// as a multiple of the average partition size (totalNodes /
+// NUM_PARTITIONS). This is what keeps one well-connected hub from
+// swallowing the whole network into a single partition.
+const MAX_SIZE_MULTIPLIER = 1.6;
+
+// ---------------------------------------------------------------------
+// Geography helpers
+// ---------------------------------------------------------------------
+
+const EARTH_RADIUS_KM = 6371;
+
+function toRad(deg) {
+  return (deg * Math.PI) / 180;
+}
+
+// Standard haversine distance between two lat/lon points, in km.
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) ** 2;
+
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+  return EARTH_RADIUS_KM * c;
+}
+
+// ---------------------------------------------------------------------
+// Small max-heap for the best-first partition growth. Kept local to this
+// file since it only ever holds { score, node, partitionIndex } entries.
+// ---------------------------------------------------------------------
+
+class MaxHeap {
+  constructor() {
+    this.items = [];
+  }
+
+  get size() {
+    return this.items.length;
+  }
+
+  push(item) {
+    this.items.push(item);
+    this._up(this.items.length - 1);
+  }
+
+  pop() {
+    if (this.items.length === 0) return null;
+
+    const root = this.items[0];
+    const last = this.items.pop();
+
+    if (this.items.length > 0) {
+      this.items[0] = last;
+      this._down(0);
+    }
+
+    return root;
+  }
+
+  _up(i) {
+    while (i > 0) {
+      const parent = Math.floor((i - 1) / 2);
+      if (this.items[parent].score >= this.items[i].score) break;
+
+      [this.items[parent], this.items[i]] =
+        [this.items[i], this.items[parent]];
+      i = parent;
+    }
+  }
+
+  _down(i) {
+    const n = this.items.length;
+
+    while (true) {
+      let largest = i;
+      const left = i * 2 + 1;
+      const right = i * 2 + 2;
+
+      if (left < n && this.items[left].score > this.items[largest].score) {
+        largest = left;
+      }
+      if (right < n && this.items[right].score > this.items[largest].score) {
+        largest = right;
+      }
+      if (largest === i) break;
+
+      [this.items[i], this.items[largest]] =
+        [this.items[largest], this.items[i]];
+      i = largest;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------
+// Main entry point
+// ---------------------------------------------------------------------
+
+/**
+ * @param {string[]} nodeIds - every node id in the graph
+ * @param {Map<string, {lat:number, lon:number}>} nodeCoords - coordinates,
+ *   used for the geography term. Nodes with missing coordinates just get a
+ *   geography score of 0, so this degrades gracefully if the dataset ever
+ *   lacks lat/lon for some nodes.
+ * @param {Array<{id, from_node, to_node, distance}>} edges - raw edge rows
+ * @param {object} [options] - override any of the config constants above
+ *   for a single call, e.g. { numPartitions: 20, topologyWeight: 0.7 }.
+ *   This is what lets the API run different experiments without editing
+ *   this file.
+ */
+function detectPartitions(nodeIds, nodeCoords, edges, options = {}) {
+  console.time("HYBRID_TOTAL");
+  const numPartitions = options.numPartitions ?? NUM_PARTITIONS;
+  const topologyWeight = options.topologyWeight ?? TOPOLOGY_WEIGHT;
+  const geographicWeight = options.geographicWeight ?? GEOGRAPHIC_WEIGHT;
+  const trafficWeight = options.trafficWeight ?? TRAFFIC_WEIGHT;
+  const minSeedSeparationKm =
+    options.minSeedSeparationKm ?? MIN_SEED_SEPARATION_KM;
+
+  const targetPartitionSize = Math.max(
+    1,
+    Math.ceil(nodeIds.length / numPartitions)
+  );
+  const maxPartitionSize = Math.ceil(
+    targetPartitionSize * MAX_SIZE_MULTIPLIER
+  );
+
+  // -----------------------------------------------------------------
+  // 1. Build undirected adjacency, keeping edge cost so the traffic
+  //    term has something to work with. Cost here uses the same
+  //    distance-based weight the router itself uses (see
+  //    graphEngine._weight) - this keeps the partitioning consistent
+  //    with what Dijkstra actually optimizes for.
+  // -----------------------------------------------------------------
+
+  const adj = new Map();
+  for (const id of nodeIds) adj.set(id, []);
+
+  for (const e of edges) {
+    if (!adj.has(e.from_node) || !adj.has(e.to_node)) continue;
+
+    const cost = Number(e.distance);
+
+    adj.get(e.from_node).push({ neighbor: e.to_node, cost });
+    adj.get(e.to_node).push({ neighbor: e.from_node, cost });
+  }
+
+  const degree = new Map();
+  for (const id of nodeIds) degree.set(id, adj.get(id).length);
+
+  // -----------------------------------------------------------------
+  // 2. Pick seeds: highest-degree nodes first (well-connected, so a
+  //    good anchor for topology), skipping any candidate that's too
+  //    close to a seed we already picked. That spacing is what keeps
+  //    partitions from all starting in the same dense neighborhood.
+  // -----------------------------------------------------------------
+  console.time("SEED_SELECTION");
+  const orderedByDegree = [...nodeIds].sort(
+    (a, b) => (degree.get(b) || 0) - (degree.get(a) || 0)
+  );
+
+  const seeds = [];
+  for (const candidate of orderedByDegree) {
+    if (seeds.length >= numPartitions) break;
+
+    const coord = nodeCoords.get(candidate);
+
+    const tooClose =
+      coord &&
+      seeds.some((seedId) => {
+        const seedCoord = nodeCoords.get(seedId);
+        if (!seedCoord) return false;
+
+        return (
+          haversineKm(coord.lat, coord.lon, seedCoord.lat, seedCoord.lon) <
+          minSeedSeparationKm
+        );
+      });
+
+    if (!tooClose) seeds.push(candidate);
+  }
+
+  // If the geographic-separation rule left us short of seeds (e.g. very
+  // small or very clustered dataset), fall back to plain degree order so
+  // we still end up with `numPartitions` partitions where possible.
+  if (seeds.length < numPartitions) {
+    for (const candidate of orderedByDegree) {
+      if (seeds.length >= numPartitions) break;
+      if (!seeds.includes(candidate)) seeds.push(candidate);
+    }
+  }
+
+  // -----------------------------------------------------------------
+  // 3. Initialize one partition per seed, tracking a running centroid
+  //    (mean lat/lon) so the geography term has something cheap to
+  //    compare against - no need to re-scan the whole partition on
+  //    every candidate check.
+  // -----------------------------------------------------------------
+
+  const partitions = seeds.map(() => new Set());
+  const assigned = new Map(); // nodeId -> partitionIndex
+
+  const centroids = seeds.map(() => ({ sumLat: 0, sumLon: 0, count: 0 }));
+  // Running sum of edge costs into each partition, so the traffic term
+  // can use an average without re-walking every member edge each time.
+  const costAccumulators = seeds.map(() => ({ sumCost: 0, count: 0 }));
+
+  function addToPartition(nodeId, partitionIndex, incomingCost) {
+    partitions[partitionIndex].add(nodeId);
+    assigned.set(nodeId, partitionIndex);
+
+    const coord = nodeCoords.get(nodeId);
+    if (coord) {
+      const c = centroids[partitionIndex];
+      c.sumLat += coord.lat;
+      c.sumLon += coord.lon;
+      c.count += 1;
+    }
+
+    if (incomingCost !== undefined) {
+      const acc = costAccumulators[partitionIndex];
+      acc.sumCost += incomingCost;
+      acc.count += 1;
+    }
+  }
+
+  seeds.forEach((seedId, i) => addToPartition(seedId, i));
+
+  // -----------------------------------------------------------------
+  // 4. Best-first growth. Instead of a plain BFS queue, every reachable
+  //    unassigned neighbor of the current partitions is scored with the
+  //    hybrid formula and pushed onto a shared max-heap. We always
+  //    expand the highest-scoring candidate next, which is what makes
+  //    the growth "hybrid" rather than purely topological.
+  // -----------------------------------------------------------------
+
+  function partitionCentroid(partitionIndex) {
+    const c = centroids[partitionIndex];
+    if (c.count === 0) return null;
+    return { lat: c.sumLat / c.count, lon: c.sumLon / c.count };
+  }
+
+  function partitionAvgCost(partitionIndex) {
+    const acc = costAccumulators[partitionIndex];
+    if (acc.count === 0) return null;
+    return acc.sumCost / acc.count;
+  }
+
+  function hybridScore(nodeId, partitionIndex, sharedEdges, edgeCost) {
+    const nodeDegree = degree.get(nodeId) || 1;
+
+    // Topology: fraction of this node's edges that already point into
+    // the candidate partition. Ranges 0..1.
+    const topologyScore = sharedEdges / nodeDegree;
+
+    // Geography: closeness to the partition's centroid, mapped into
+    // 0..1 with a simple inverse-distance curve. Falls back to 0 when
+    // coordinates are missing for either side.
+    const coord = nodeCoords.get(nodeId);
+    const centroid = partitionCentroid(partitionIndex);
+    const geographyScore =
+      coord && centroid
+        ? 1 / (1 + haversineKm(coord.lat, coord.lon, centroid.lat, centroid.lon))
+        : 0;
+
+    // Traffic/cost: cheaper edges (faster/shorter roads) score higher.
+    // Uses the same weight the router itself uses, so partitioning and
+    // routing agree on what "cheap" means.
+    const trafficScore = 1 / (1 + edgeCost);
+
+    return (
+      topologyWeight * topologyScore +
+      geographicWeight * geographyScore +
+      trafficWeight * trafficScore
+    );
+  }
+
+  const heap = new MaxHeap();
+
+  function pushCandidatesFrom(nodeId, partitionIndex) {
+    for (const { neighbor, cost } of adj.get(nodeId) || []) {
+      if (assigned.has(neighbor)) continue;
+
+      // Count how many of the neighbor's edges already land in this
+      // partition - this is the topology term's numerator.
+      let sharedEdges = 0;
+      for (const link of adj.get(neighbor) || []) {
+        if (assigned.get(link.neighbor) === partitionIndex) sharedEdges += 1;
+      }
+
+      const score = hybridScore(neighbor, partitionIndex, sharedEdges, cost);
+
+      heap.push({ score, node: neighbor, partitionIndex, cost });
+    }
+  }
+
+  seeds.forEach((seedId, i) => pushCandidatesFrom(seedId, i));
+
+  while (heap.size > 0) {
+    const { node, partitionIndex, cost } = heap.pop();
+
+    if (assigned.has(node)) continue;
+    if (partitions[partitionIndex].size >= maxPartitionSize) continue;
+
+    addToPartition(node, partitionIndex, cost);
+    pushCandidatesFrom(node, partitionIndex);
+  }
+
+  // -----------------------------------------------------------------
+  // 5. Leftover nodes: anything the best-first growth didn't reach,
+  //    usually because every partition bordering it had already hit
+  //    the size cap while other parts of the frontier were still
+  //    expanding. Attach each one to whichever partition it has the
+  //    most/cheapest connections to.
+  //
+  //    This runs in repeated passes rather than a single linear scan:
+  //    a leftover node's neighbor might itself be a leftover node that
+  //    only gets assigned later in the same pass, so one pass alone
+  //    would miss connections and fragment the network into lots of
+  //    tiny one-off partitions. Looping until nothing changes lets
+  //    those chains resolve properly.
+  // -----------------------------------------------------------------
+
+  function bestConnectedPartition(nodeId, sizeLimit) {
+    let bestPartition = -1;
+    let bestScore = -Infinity;
+
+    for (let i = 0; i < partitions.length; i++) {
+      if (sizeLimit !== null && partitions[i].size >= sizeLimit) continue;
+
+      let sharedEdges = 0;
+      let cheapestCost = Infinity;
+
+      for (const link of adj.get(nodeId) || []) {
+        if (assigned.get(link.neighbor) === i) {
+          sharedEdges += 1;
+          cheapestCost = Math.min(cheapestCost, link.cost);
+        }
+      }
+
+      if (sharedEdges === 0) continue;
+
+      const score = hybridScore(
+        nodeId,
+        i,
+        sharedEdges,
+        Number.isFinite(cheapestCost) ? cheapestCost : 0
+      );
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestPartition = i;
+      }
+    }
+
+    return bestPartition;
+  }
+
+  function tryAssignLeftover(nodeId) {
+    // Prefer a partition that's still under the size cap. A road network
+    // is mostly long degree-2 chains, though, so a leftover node's only
+    // assigned neighbor can end up belonging entirely to an already-full
+    // partition (a dead-end street dangling off a busy junction, for
+    // example). Splitting that chain across partitions just to respect
+    // the cap would create a cross-partition edge for no real benefit -
+    // and stranding the node in its own one-node partition is worse
+    // still, since a one-node partition has no internal edges to route
+    // through. So the cap is allowed to slip for leftovers: the growth
+    // phase above is what actually keeps partitions balanced, this is
+    // just cleanup for what it couldn't reach.
+    let target = bestConnectedPartition(nodeId, maxPartitionSize);
+    if (target < 0) target = bestConnectedPartition(nodeId, null);
+
+    if (target >= 0) {
+      addToPartition(nodeId, target);
+      return true;
+    }
+
+    return false;
+  }
+
+  let leftoverProgress = true;
+  while (leftoverProgress) {
+    leftoverProgress = false;
+
+    for (const nodeId of nodeIds) {
+      if (assigned.has(nodeId)) continue;
+      if (tryAssignLeftover(nodeId)) leftoverProgress = true;
+    }
+  }
+
+  // Anything still unassigned at this point has no path to an existing
+  // partition even through other leftovers (e.g. a disconnected
+  // component, or a pocket boxed in entirely by full partitions).
+  // Group these into fresh partitions using the same repeated-pass
+  // approach, so a chain of several such nodes still ends up as one
+  // partition instead of many singletons.
+  const stillUnassigned = nodeIds.filter(id => !assigned.has(id));
+
+  for (const nodeId of stillUnassigned) {
+    if (assigned.has(nodeId)) continue;
+
+    const newIndex = partitions.length;
+    partitions.push(new Set());
+    centroids.push({ sumLat: 0, sumLon: 0, count: 0 });
+    costAccumulators.push({ sumCost: 0, count: 0 });
+
+    addToPartition(nodeId, newIndex);
+
+    // Pull in anything connected to this node (directly or through
+    // other still-unassigned nodes) before moving on to the next
+    // fresh partition.
+    let progress = true;
+    while (progress) {
+      progress = false;
+      for (const other of stillUnassigned) {
+        if (assigned.has(other)) continue;
+        if (tryAssignLeftover(other)) progress = true;
+      }
+    }
+  }
+
+  // -----------------------------------------------------------------
+  // 6. Rank partitions by size and relabel as P1, P2, ... so the
+  //    biggest partition is always P1. Purely cosmetic/stable naming,
+  //    same as the previous partitioner.
+  // -----------------------------------------------------------------
+
+  const ranked = partitions
+    .map((partition, index) => ({ index, size: partition.size }))
+    .sort((a, b) => b.size - a.size);
+
+  const oldToNew = new Map();
+  ranked.forEach(({ index }, rank) => oldToNew.set(index, `P${rank + 1}`));
+
+  const nodePartition = new Map();
+  for (const [nodeId, index] of assigned) {
+    nodePartition.set(nodeId, oldToNew.get(index));
+  }
+
+  const palette = [
+    { color: "#1C2E4A22", border: "#1C2E4A" },
+    { color: "#52677D22", border: "#52677D" },
+    { color: "#BDC4D422", border: "#8a9ab0" },
+    { color: "#0F1A2B22", border: "#0F1A2B" },
+    { color: "#D1CFC922", border: "#9a9890" },
+    { color: "#2d4a3e22", border: "#3d7a5a" },
+    { color: "#4a2d3d22", border: "#7a4055" },
+  ];
+
+  const partitionInfo = {};
+  ranked.forEach(({ size }, rank) => {
+    const id = `P${rank + 1}`;
+    const p = palette[rank % palette.length];
+
+    partitionInfo[id] = {
+      id,
+      name: `Zone ${id}`,
+      color: p.color,
+      border: p.border,
+      nodeCount: size,
+    };
+  });
+
+  // -----------------------------------------------------------------
+  // 7. Partition-quality metrics. These are what the API exposes so the
+  //    hybrid approach can actually be evaluated instead of assumed to
+  //    be better - see PARTITION QUALITY / METRICS in the project
+  //    readme.
+  // -----------------------------------------------------------------
+
+  const metrics = computePartitionMetrics(nodeIds, edges, nodePartition, {
+    numPartitions,
+    targetPartitionSize,
+    weights: {
+      topology: topologyWeight,
+      geographic: geographicWeight,
+      traffic: trafficWeight,
+    },
+  });
+
+  return {
+    nodePartition,
+    partitions: partitionInfo,
+    metrics,
+  };
+}
+
+// ---------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------
+
+/**
+ * Computes the partition-quality numbers called out in the project
+ * requirements: size distribution/balance and cross-partition edge count.
+ * Kept separate from detectPartitions so it can also be reused if a
+ * partitioning is ever loaded from somewhere else.
+ */
+function computePartitionMetrics(nodeIds, edges, nodePartition, context = {}) {
+  const sizeByPartition = new Map();
+  for (const id of nodeIds) {
+    const p = nodePartition.get(id);
+    sizeByPartition.set(p, (sizeByPartition.get(p) || 0) + 1);
+  }
+
+  const sizes = [...sizeByPartition.values()];
+  const avgSize = sizes.length
+    ? sizes.reduce((a, b) => a + b, 0) / sizes.length
+    : 0;
+  const maxSize = sizes.length ? Math.max(...sizes) : 0;
+  const minSize = sizes.length ? Math.min(...sizes) : 0;
+
+  // Balance ratio: 1.0 means every partition is exactly the same size,
+  // smaller means more skewed. Simple and easy to explain in a review.
+  const balanceRatio = maxSize > 0 ? minSize / maxSize : 1;
+
+  let crossPartitionEdges = 0;
+  let totalEdges = 0;
+
+  for (const e of edges) {
+    totalEdges += 1;
+
+    const fromPartition = nodePartition.get(e.from_node);
+    const toPartition = nodePartition.get(e.to_node);
+
+    if (fromPartition !== toPartition) {
+      crossPartitionEdges += 1;
+    }
+  }
+
+  const crossPartitionEdgeRatio =
+    totalEdges > 0 ? crossPartitionEdges / totalEdges : 0;
+
+  return {
+    numPartitions: sizeByPartition.size,
+    targetNumPartitions: context.numPartitions,
+    targetPartitionSize: context.targetPartitionSize,
+    weightsUsed: context.weights,
+    partitionSizeDistribution: Object.fromEntries(sizeByPartition),
+    avgPartitionSize: Math.round(avgSize * 100) / 100,
+    maxPartitionSize: maxSize,
+    minPartitionSize: minSize,
+    balanceRatio: Math.round(balanceRatio * 1000) / 1000,
+    crossPartitionEdges,
+    totalEdges,
+    crossPartitionEdgeRatio:
+      Math.round(crossPartitionEdgeRatio * 1000) / 1000,
+  };
+}
+
+module.exports = {
+  detectPartitions,
+  computePartitionMetrics,
+  DEFAULT_CONFIG: {
+    NUM_PARTITIONS,
+    TOPOLOGY_WEIGHT,
+    GEOGRAPHIC_WEIGHT,
+    TRAFFIC_WEIGHT,
+    MIN_SEED_SEPARATION_KM,
+    MAX_SIZE_MULTIPLIER,
+  },
+};
